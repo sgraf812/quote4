@@ -329,14 +329,14 @@ partial def Impl.hasQMatch : Syntax → Bool
   | `(~q($_)) => true
   | stx => stx.getArgs.any hasQMatch
 
-partial def Impl.floatQMatch (alt : TSyntax ``doSeqIndent) : Term → StateT (List (TSyntax ``doSeqItem)) MacroM Term
+partial def Impl.floatQMatchPairs : Term → StateT (Array (Term × Ident)) MacroM Term
   | `(~q($term)) =>
     withFreshMacroScope do
-      let auxDoElem ← `(doSeqItem| let ~q($term) := x | $alt)
-      modify fun s => s ++ [auxDoElem]
-      `(x)
+      let x : Ident ← `(x)
+      modify (·.push (term, x))
+      `($x)
   | stx => do match stx with
-    | ⟨.node i k args⟩ => return ⟨.node i k (← args.mapM (floatQMatch alt ⟨·⟩))⟩
+    | ⟨.node i k args⟩ => return ⟨.node i k (← args.mapM (floatQMatchPairs ⟨·⟩))⟩
     | stx => return stx
 
 private def push (i : TSyntax ``doSeqItem) : StateT (Array (TSyntax ``doSeqItem)) MacroM Unit :=
@@ -385,6 +385,41 @@ private partial def floatExprAntiquot (depth : Nat) : Term → StateT (Array (TS
       | ⟨.node i k args⟩ => return ⟨.node i k (← args.mapM (floatExprAntiquot depth ⟨·⟩))⟩
       | stx => return stx
 
+private def applyLifts (lifts : Array (TSyntax ``doSeqItem)) (body : Term) : MacroM Term := do
+  let mut body := body
+  for lift in lifts.reverse do
+    match lift with
+    | `(doSeqItem| let $n:ident : $ty := $val) =>
+      body ← `(let $n : $ty := $val; $body)
+    | _ => Macro.throwError "unexpected lift in term context"
+  return body
+
+private partial def buildPatternTerm (discr : Term) (pat : Term) (body : Term) : MacroM Term := do
+  if isIrrefutablePattern pat then
+    `(let $pat:term := $discr; $body)
+  else match pat with
+  | `(~q($inner)) =>
+    let (inner, lifts) ← (floatExprAntiquot 0 inner).run #[]
+    let mut body := body
+    body ← `(_qq_match $inner ← $discr | __alt in $body)
+    applyLifts lifts body
+  | _ =>
+    if hasQMatch pat then
+      let (pat', auxPairs) ← (floatQMatchPairs pat).run #[]
+      let mut body := body
+      for (innerPat, varName) in auxPairs.reverse do
+        let (innerPat, lifts) ← (floatExprAntiquot 0 innerPat).run #[]
+        body ← `(_qq_match $innerPat ← $varName | __alt in $body)
+        body ← applyLifts lifts body
+      if isIrrefutablePattern pat' then
+        `(let $pat':term := $discr; $body)
+      else do
+        let alt ← `(__alt)
+        `(match $discr:term with | $pat' => $body | _ => $alt)
+    else do
+      let alt ← `(__alt)
+      `(match $discr:term with | $pat => $body | _ => $alt)
+
 macro_rules
   | `(doElem| let $pat:term := $_) => do
     if !hasQMatch pat then Macro.throwUnsupported
@@ -402,27 +437,12 @@ macro_rules
         `(doElem| do $items:doSeqItem*)
 
       | _ =>
-        let (pat', auxs) ← floatQMatch (← `(doSeqIndent| __alt)) pat []
-        -- Build the nested body from inside out, so that every `doLetElse` always has a body.
-        -- This is necessary because the do elaborator defaults body to `pure PUnit.unit`
-        -- when no body is provided, causing type mismatches.
         let body ← match body? with
-          | some body => `(doElem| do $body:doSeqIndent)
-          | none => `(doElem| pure PUnit.unit)
-        let mut body := body
-        for aux in auxs.reverse do
-          body ← `(doElem| do $aux:doSeqItem
-                                   $body:doElem)
-        let outerRhs ← match pat' with
-        | `(_) => pure body
-        | _ =>
-          if isIrrefutablePattern pat' then
-            `(doElem| do let $pat':term := $rhs; $body:doElem)
-          else
-            `(doElem| let $pat':term := $rhs | __alt -- line break to break up application
-                      $body:doElem)
+          | some body => `(do $body:doSeqIndent)
+          | none => `(pure PUnit.unit)
+        let body ← buildPatternTerm rhs pat body
         `(doElem| do comefrom __alt do $alt:doSeqIndent
-                     $outerRhs:doElem)
+                     ($body))
 
   | `(match $[$gen:generalizingParam]? $[$discrs:term],* with $[| $[$patss],* => $rhss]*) => do
     if !patss.any (·.any (hasQMatch ·)) then Macro.throwUnsupported
@@ -440,14 +460,10 @@ macro_rules
     let mut items := #[]
     items := items.push (← `(doSeqItem| comefrom __alt do throwError "nonexhaustive match"))
     for pats in patss.reverse, rhs in rhss.reverse do
-      let mut rhs ← `(doElem| do $rhs)
+      let mut body ← `(do $rhs)
       for discr in discrs.reverse, pat in pats.reverse do
-        if isIrrefutablePattern pat then
-          rhs ← `(doElem| do let $pat:term := $discr; $rhs:doElem)
-        else
-          rhs ← `(doElem| let $pat:term := $discr | __alt -- line break to break up application
-                           $rhs:doElem)
-      items := items.push (← `(doSeqItem| comefrom __alt do $rhs:doElem))
+        body ← buildPatternTerm discr pat body
+      items := items.push (← `(doSeqItem| comefrom __alt do ($body)))
     items := items.push (← `(doSeqItem| __alt))
     `(doElem| (do $items:doSeqItem*))
 
